@@ -1,0 +1,1531 @@
+#!/usr/bin/env python3
+"""
+yt-gem v1.0 — AI-agent-native YouTube distiller via free Gemini web.
+
+Problem: another AI agent "watching" a YouTube video is expensive — download,
+frames, transcription, and a huge context bill, for a result that is often
+just a thin summary. Free Gemini web already watches the video natively when
+you paste its URL into chat. yt-gem turns that into a one-command,
+machine-consumable distillation:
+
+    yt-gem https://www.youtube.com/watch?v=dQw4w9WgXcQ
+        -> {"ok": true, "f": ".../dQw4w9WgXcQ.detail.md", "s": 8421,
+            "video_id": "dQw4w9WgXcQ", "mode": "detail", "sections": [...], ...}
+
+The full distillation lives on disk (markdown). Stdout is only a ~200-char
+JSON pointer, so the calling agent can decide what to read — the TL;DR, one
+chapter slice, or the claims list — instead of swallowing the whole video.
+
+Prototype: lesterppo/hermes-gem-pw (gem-pw / gemini-web). yt-gem reuses its
+proven patterns, not its code by copy-paste accident:
+  * real headed Chromium via Playwright (Gemini's endpoints are browser-gated;
+    curl/httpx/WebAPI clients are silently dropped — see gem-pw README),
+  * CDP-first (warm browser on 127.0.0.1:9224) with headed fallback,
+  * the SAME browser profile as gem-pw (~/.gemini-cli/cr-profile, falling
+    back to the gem-pw-login profile), so one sign-in serves both tools,
+  * a shared profile lock (~/.hermes/gem_pw.lock) so yt-gem and gem-pw never
+    collide on the same Chromium profile,
+  * xvfb-run fallback when DISPLAY is unset, locale-agnostic selectors,
+  * placeholder-guard + stability polling for the response (never return a
+    half-streamed "Analyzing…" as a result),
+  * agent-native error codes (NOT_SIGNED_IN, BAD_URL, VIDEO_NOT_ACCESSIBLE,
+    EMPTY, LOCKED, NO_INPUT, TYPE_FAILED).
+
+Usage:
+  yt-gem <youtube-url-or-id>                  Detailed distillation (default)
+  yt-gem <url> --brief                        TL;DR + takeaways only
+  yt-gem <url> --chapters                     Timestamped chapter breakdown only
+  yt-gem <url> --claims                       Verifiable claims + evidence only
+  yt-gem <url> "What does the speaker say about X?"
+                                              Answer one question about the video
+  yt-gem --followup -c sess.json "Follow-up?" Ask a follow-up in the same
+                                              Gemini conversation (no re-watch)
+  yt-gem <url> --dry-run                      Parse + build prompt, no browser
+  yt-gem <url> --dry-run --print-prompt       Show the exact prompt sent
+  yt-gem <url> -o out.md -t 600               Custom output, longer timeout
+  yt-gem <url> --force                        Ignore the cache, re-distill
+  yt-gem <url> --gem <gem-id>                 Distill through a specific Gem
+
+Caching: a default-mode distillation is cached at
+  ~/.hermes/yt_gem_output/<video_id>.<mode>.md
+plus a <video_id>.<mode>.json sidecar (sections, timestamps, word count).
+A second agent asking for the same video + mode gets the cached pointer in
+milliseconds and Gemini is never re-asked. Custom questions and follow-ups
+are never cached (they are conversation, not a canonical distillation).
+
+Honesty rules (baked into every prompt, and into the output contract):
+  * Timestamps are Gemini's, not verified against the video. Treat them as
+    pointers ("look near 12:34"), not as ground truth.
+  * A quote is only quoted verbatim when Gemini is confident; otherwise it
+    is paraphrased. The prompt forces this distinction.
+  * If Gemini cannot access/play the video (private, removed, age-gated,
+    region-blocked), it must answer with the single sentinel
+    VIDEO_NOT_ACCESSIBLE — yt-gem turns that into a machine error instead
+    of a hallucinated summary. A hallucinated summary is worse than no
+    summary; this tool refuses to produce one silently.
+  * This is NOT a verbatim transcript. If you need exact wording, watch the
+    captioned segment at the cited timestamp.
+
+No API key. No cookies in code. Sign in once (gem-pw-login, or the bundled
+yt-gem-login) and the profile persists.
+
+CONNECTION FIX (2026-10-25, this VM): Chromium cannot do this VM's egress
+proxy auth directly — it fails with ERR_TUNNEL_CONNECTION_FAILED, while
+curl/Python through the same proxy work, and gemini.google.com additionally
+drops HTTP/1.1 requests after a successful CONNECT+TLS (curl --http2
+returns 200, curl default returns 000). The proven route, taken from
+tos-cli/proxy_fwd.py, is a localhost CONNECT forwarder
+(vendored as proxy_fwd.py): it listens on 127.0.0.1:8888 with no auth,
+dials the upstream proxy at its IPv4 address explicitly (the proxy
+hostname's IPv6 record hangs from this VM), and injects
+Proxy-Authorization from $https_proxy. yt-gem starts that forwarder
+automatically on this VM and points headed Chromium at it, with
+ignore_https_errors (the TLS-intercept CA is not trusted by Playwright
+Chromium for every host). Chromium negotiates HTTP/2 by default, so the
+HTTP/1.1 drop does not apply to the browser path. Set
+YT_GEM_NO_FWD=1 to disable the forwarder on a normal network.
+"""
+
+import argparse
+import asyncio
+import fcntl
+import json
+import os
+import re
+import shutil as _shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except Exception:
+    pass
+
+__version__ = "1.0.0"
+
+# ── Headless fallback: virtual display via xvfb-run ───────────────────────
+# Same trick as gem-pw: headed Chromium slips past Google's anti-automation,
+# but a headed browser needs an X server. Re-exec under xvfb-run when DISPLAY
+# is unset so cron/SSH/remote runs still get a (virtual) headed browser.
+if (not os.environ.get("DISPLAY")
+        and os.environ.get("YT_GEM_XVFB", "1") != "0"
+        and not os.environ.get("_YT_GEM_XVFB_WRAPPED")
+        and _shutil.which("xvfb-run")):
+    os.environ["_YT_GEM_XVFB_WRAPPED"] = "1"
+    _xvfb = [_shutil.which("xvfb-run"), "-a", sys.executable] + sys.argv
+    try:
+        os.execvp(_xvfb[0], _xvfb)
+    except Exception as _e:
+        sys.stderr.write(f"[yt-gem] xvfb-run re-exec failed ({_e}); continuing\n")
+
+# ── Paths / constants (same profile family as gem-pw) ─────────────────────
+_HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home())))
+_GEMINI_HOME = Path.home() / ".gemini-cli"
+OUTPUT_DIR = Path(os.environ.get("YT_GEM_OUTPUT_DIR")
+                  or str(_HERMES_HOME / ".hermes" / "yt_gem_output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Shared with gem-pw: both tools drive ONE Chromium profile, so one lock
+# serialises both. A yt-gem-only lock would let gem-pw collide mid-run.
+_LOCK_PATH = _HERMES_HOME / ".hermes" / "gem_pw.lock"
+_LOCK_FD = None
+CDP_URL = os.environ.get("YT_GEM_CDP",
+                         os.environ.get("GEM_PW_CDP",
+                                        os.environ.get("GEMINI_CDP",
+                                                       "http://127.0.0.1:9224")))
+APP_URL = "https://gemini.google.com/app"
+_SESSION_MODE = None
+QUIET = False
+JSON_OUT = False
+
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_TS_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+_HEADING_RE = re.compile(r"^#{2,3}\s+(.+?)\s*$", re.M)  # ## sections only, not the # title
+
+
+def _log(msg):
+    if QUIET:
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
+    os.write(2, f"[yt {ts}] {msg}\n".encode())
+
+
+def _emit(d):
+    print(json.dumps(d, ensure_ascii=False))
+
+
+def _err(code, msg, **extra):
+    d = {"ok": False, "err": code, "msg": msg}
+    d.update(extra)
+    return d
+
+
+def _ok(**kw):
+    d = {"ok": True}
+    d.update(kw)
+    return d
+
+
+# ── YouTube URL parsing ───────────────────────────────────────────────────
+def parse_youtube_id(s):
+    """Return the 11-char video id, or None. Accepts bare ids and every
+    public URL shape: watch?v=, youtu.be/, shorts/, live/, embed/, v/.
+    Playlist / channel / search URLs without a video id return None."""
+    if not s:
+        return None
+    s = s.strip()
+    if _ID_RE.match(s):
+        return s
+    # Tolerate a bare URL pasted without scheme.
+    if not re.match(r"^https?://", s, re.I):
+        s = "https://" + s
+    try:
+        u = urlparse(s)
+    except Exception:
+        return None
+    host = (u.hostname or "").lower()
+    if host in ("youtu.be", "www.youtu.be"):
+        parts = [p for p in u.path.split("/") if p]
+        if parts and _ID_RE.match(parts[0]):
+            return parts[0]
+        return None
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        qs = parse_qs(u.query)
+        v = qs.get("v", [None])[0]
+        if v and _ID_RE.match(v):
+            return v
+        parts = [p for p in u.path.split("/") if p]
+        if len(parts) >= 2 and parts[0] in ("shorts", "live", "embed", "v"):
+            if _ID_RE.match(parts[1]):
+                return parts[1]
+        return None
+    return None
+
+
+def canonical_url(video_id):
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+# ── Prompts ───────────────────────────────────────────────────────────────
+# Every prompt carries the same honesty block: timestamps only when known,
+# verbatim-vs-paraphrase distinction, and the VIDEO_NOT_ACCESSIBLE sentinel.
+# Without the sentinel, a model that cannot play the video will happily
+# summarise its title/description and the caller cannot tell the difference.
+_HONESTY = (
+    "Honesty rules (follow exactly):\n"
+    "- Use the video itself — spoken audio, on-screen text, and visuals — "
+    "not only its title or description. If a section comes only from the "
+    "description, say so.\n"
+    "- Timestamp format is MM:SS or HH:MM:SS. Never invent a timestamp: if "
+    "you are unsure of one, write [timestamp unknown] instead of guessing.\n"
+    "- Quote short phrases verbatim ONLY when you are confident of the exact "
+    "words; otherwise paraphrase and do not use quotation marks.\n"
+    "- If you cannot access, play, or hear this video for any reason "
+    "(private, removed, age-restricted, region-blocked, no captions and "
+    "unclear audio), reply with exactly this and nothing else:\n"
+    "VIDEO_NOT_ACCESSIBLE — followed by one short sentence explaining why.\n"
+)
+
+_PREAMBLE = (
+    "You are distilling a YouTube video for another AI agent that cannot "
+    "watch video. Be detailed and specific: keep examples, steps, numbers, "
+    "names, and caveats. Do not compress away the substance into vague "
+    "generalities. Return markdown only.\n\n"
+    "Video: {url}\n\n"
+)
+
+DETAIL_PROMPT = _PREAMBLE + (
+    "Distill the whole video in detail, with exactly these sections in order:\n\n"
+    "# <video title as spoken/shown, or Unknown title>\n"
+    "- Source: {url}\n"
+    "- Video ID: {video_id}\n\n"
+    "## TL;DR\n"
+    "At most 150 words: what the video is about and its single most important "
+    "conclusion or takeaway.\n\n"
+    "## At a glance\n"
+    "Bullets for: duration if known, language, speaker/channel if known, "
+    "intended audience, main topic, and format (talk, tutorial, demo, "
+    "interview, review, etc.). Mark anything unknown as unknown.\n\n"
+    "## Chronological breakdown\n"
+    "Cover every major segment in order, including the middle — do not skip "
+    "to the conclusion. Each segment: `- [MM:SS] Title — 3-6 sentences` "
+    "with the segment's key points, examples, numbers, names, and any "
+    "on-screen text that matters.\n\n"
+    "## Key claims and evidence\n"
+    "One bullet per substantive claim: the claim, its timestamp, and whether "
+    "it was spoken, shown on screen, or only in the description.\n\n"
+    "## Numbers, names and definitions\n"
+    "Verbatim numbers (with units), people/products/places named, and any "
+    "term the video defines, each with a timestamp where possible.\n\n"
+    "## Resources and links mentioned\n"
+    "Anything the speaker recommends or links (tools, papers, books, sites, "
+    "other videos), with timestamps.\n\n"
+    "## What is NOT in the video / uncertainties\n"
+    "What you could not hear, see, or verify; questions the video raises "
+    "but does not answer; and any timestamp you are unsure about.\n\n"
+    + _HONESTY
+)
+
+BRIEF_PROMPT = _PREAMBLE + (
+    "Give a short distillation only:\n\n"
+    "# <video title, or Unknown title>\n"
+    "- Source: {url}\n\n"
+    "## TL;DR\n"
+    "At most 150 words.\n\n"
+    "## Takeaways\n"
+    "5-10 bullets, each with a timestamp where possible. Keep numbers and "
+    "names exact.\n\n"
+    + _HONESTY
+)
+
+CHAPTERS_PROMPT = _PREAMBLE + (
+    "Give ONLY a timestamped chapter breakdown, nothing else:\n\n"
+    "# <video title, or Unknown title>\n"
+    "- Source: {url}\n\n"
+    "## Chapters\n"
+    "One entry per chapter/segment in order: `## [MM:SS] Chapter title` "
+    "followed by 2-4 sentences on what happens in that chapter, including "
+    "its key detail, example, or number. Cover the whole video, including "
+    "the middle chapters.\n\n"
+    + _HONESTY
+)
+
+CLAIMS_PROMPT = _PREAMBLE + (
+    "Give ONLY verifiable claims from the video, nothing else:\n\n"
+    "# <video title, or Unknown title>\n"
+    "- Source: {url}\n\n"
+    "## Claims\n"
+    "One bullet per claim, in video order: `- [MM:SS] Claim — spoken / "
+    "on-screen / description`. Include every number, date, name, and "
+    "causal claim you can support from the video. Leave out opinions "
+    "unless you label them as the speaker's opinion. End with a short "
+    "`## Uncertainties` list for claims you could not verify.\n\n"
+    + _HONESTY
+)
+
+ASK_TEMPLATE = _PREAMBLE + (
+    "Answer this question about the video in detail, using the video itself "
+    "(spoken audio, on-screen text, visuals), not only its title or "
+    "description:\n\n"
+    "Question: {question}\n\n"
+    "Structure your answer as:\n"
+    "## Answer\n"
+    "A direct answer first, then the supporting detail.\n\n"
+    "## Evidence\n"
+    "Bullets with timestamps for each supporting point, marked spoken / "
+    "on-screen / description.\n\n"
+    "## Caveats\n"
+    "Anything the video does NOT say about this question, or that you "
+    "could not verify. If the video does not address the question at all, "
+    "say so plainly instead of answering from general knowledge.\n\n"
+    + _HONESTY
+)
+
+MODE_PROMPTS = {
+    "detail": DETAIL_PROMPT,
+    "brief": BRIEF_PROMPT,
+    "chapters": CHAPTERS_PROMPT,
+    "claims": CLAIMS_PROMPT,
+}
+
+
+def build_prompt(video_id, mode="detail", question=None):
+    """Build the exact prompt sent to Gemini. Pure function — unit-tested,
+    and the thing --dry-run/--print-prompt shows."""
+    url = canonical_url(video_id)
+    if question:
+        return ASK_TEMPLATE.format(url=url, video_id=video_id, question=question)
+    tmpl = MODE_PROMPTS.get(mode, DETAIL_PROMPT)
+    return tmpl.format(url=url, video_id=video_id)
+
+
+# ── Output parsing / sidecar ──────────────────────────────────────────────
+def parse_sections(md):
+    """Split markdown into [{section, start, chars}] by ## / ### headings.
+    The calling agent uses `start` to slice one section out of the file
+    without reading the whole distillation."""
+    sections = []
+    matches = list(_HEADING_RE.finditer(md or ""))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md)
+        sections.append({
+            "section": m.group(1).strip(),
+            "start": m.start(),
+            "chars": end - m.start(),
+        })
+    return sections
+
+
+def parse_title(md):
+    m = re.search(r"^#\s+(.+?)\s*$", md or "", re.M)
+    return m.group(1).strip() if m else ""
+
+
+def build_sidecar(video_id, url, mode, model, md, elapsed):
+    sections = parse_sections(md)
+    return {
+        "video_id": video_id,
+        "url": url,
+        "mode": mode,
+        "model": model,
+        "title": parse_title(md),
+        "words": len(md.split()),
+        "chars": len(md),
+        "timestamps": len(set(_TS_RE.findall(md))),
+        "sections": [s["section"] for s in sections],
+        "section_index": sections,
+        "seconds": round(elapsed, 1),
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def cache_paths(video_id, mode):
+    # NOTE: do NOT use Path.with_suffix here — it would replace ".detail"
+    # with ".md" and collapse every mode onto one <id>.md file.
+    return (OUTPUT_DIR / f"{video_id}.{mode}.md",
+            OUTPUT_DIR / f"{video_id}.{mode}.json")
+
+
+def save_output(md, out_path, sidecar):
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md, encoding="utf-8")
+    side = out.with_suffix(".json")
+    side.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return out, side
+
+
+def load_cached(video_id, mode):
+    md_path, json_path = cache_paths(video_id, mode)
+    if md_path.exists() and json_path.exists():
+        try:
+            sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+            return md_path, sidecar
+        except Exception:
+            return md_path, None
+    if md_path.exists():
+        return md_path, None
+    return None, None
+
+
+# ── Lock (shared with gem-pw) ─────────────────────────────────────────────
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _acquire_lock():
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        return True
+    try:
+        if _LOCK_PATH.exists():
+            try:
+                old = _LOCK_PATH.read_text().strip()
+                if old and not _pid_alive(old):
+                    _LOCK_PATH.unlink()
+                    _log(f"reclaimed stale lock from dead pid {old}")
+            except Exception:
+                pass
+        _LOCK_FD = open(_LOCK_PATH, "w")
+        fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _LOCK_FD.write(str(os.getpid()))
+        _LOCK_FD.flush()
+        import atexit
+        atexit.register(_release_lock)
+        return True
+    except OSError:
+        _release_lock()
+        return False
+    except Exception:
+        _release_lock()
+        return False
+
+
+def _release_lock():
+    global _LOCK_FD
+    if _LOCK_FD is None:
+        return
+    try:
+        fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        _LOCK_FD.close()
+    except Exception:
+        pass
+    _LOCK_FD = None
+    try:
+        _LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ── Browser (CDP-first, headed fallback — gem-pw pattern) ─────────────────
+def _pick_profile():
+    """gem-pw's own launch uses cr-profile; its login helper writes
+    pw-profile. Prefer an existing signed-in profile over an empty one."""
+    if os.environ.get("YT_GEM_PROFILE"):
+        return os.environ["YT_GEM_PROFILE"]
+    for cand in (_GEMINI_HOME / "cr-profile", _GEMINI_HOME / "pw-profile"):
+        if cand.exists():
+            return str(cand)
+    return str(_GEMINI_HOME / "cr-profile")
+
+
+def _cdp_alive(url=CDP_URL):
+    try:
+        req = urllib.request.Request(url + "/json/version")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+# ── Local CONNECT forwarder (VM egress fix) ─────────────────────────────
+# Chromium + this VM's egress proxy, measured 2026-10-25:
+#   direct proxy config  -> ERR_TUNNEL_CONNECTION_FAILED (auth stage)
+#   forwarder (127.0.0.1:8888) -> gemini.google.com/app loads, title "Google Gemini"
+# The forwarder is localhost-only, holds no credentials in code (it reads
+# $https_proxy at start-up, like the tos-cli original), and is left running
+# for reuse by later yt-gem/gem-pw runs. Port override: YT_GEM_FWD_PORT.
+def _fwd_port():
+    try:
+        return int(os.environ.get("YT_GEM_FWD_PORT", "8888"))
+    except ValueError:
+        return 8888
+
+
+def _fwd_script_path():
+    here = Path(__file__).resolve().parent
+    argv_dir = None
+    try:
+        argv_dir = Path(sys.argv[0]).resolve().parent
+    except Exception:
+        pass
+    for cand in [
+        here / "proxy_fwd.py",
+        argv_dir / "proxy_fwd.py" if argv_dir else None,
+        Path.home() / "workspace" / "hermes-yt-gem" / "proxy_fwd.py",
+        Path.home() / "workspace" / "tos-cli" / "proxy_fwd.py",
+    ]:
+        if cand and cand.exists():
+            return cand
+    return None
+
+
+def _fwd_alive(port=None):
+    port = port or _fwd_port()
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _needs_forwarder():
+    """True on the VM whose egress proxy Chromium cannot use directly.
+    Explicit opt-out: YT_GEM_NO_FWD=1. Explicit opt-in on any network:
+    YT_GEM_USE_FWD=1."""
+    if os.environ.get("YT_GEM_NO_FWD") == "1":
+        return False
+    if os.environ.get("YT_GEM_USE_FWD") == "1":
+        return True
+    proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
+    return "hatch-egress-proxy" in proxy
+
+
+def _ensure_forwarder():
+    """Start the localhost forwarder if it is not already listening.
+    Returns the proxy server URL, or None if it could not be started
+    (caller then falls back to a plain headed launch)."""
+    port = _fwd_port()
+    if _fwd_alive(port):
+        return f"http://127.0.0.1:{port}"
+    script = _fwd_script_path()
+    if not script:
+        _log("forwarder script not found; continuing without it")
+        return None
+    if not (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")):
+        _log("no https_proxy set; forwarder not needed")
+        return None
+    log_path = _HERMES_HOME / ".hermes" / "yt_gem_fwd.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        lf = open(log_path, "ab")
+        subprocess.Popen([sys.executable, str(script)], stdout=lf,
+                         stderr=lf, start_new_session=True)
+        for _ in range(10):
+            if _fwd_alive(port):
+                _log(f"forwarder started on 127.0.0.1:{port} (pid log: {log_path})")
+                return f"http://127.0.0.1:{port}"
+            time.sleep(0.5)
+        _log("forwarder did not come up in 5s; continuing without it")
+        return None
+    except Exception as e:
+        _log(f"forwarder start failed ({e}); continuing without it")
+        return None
+
+
+async def _launch_headed(proxy_server=None):
+    """Headed persistent-context launch. With a forwarder proxy, also
+    ignore HTTPS errors: the egress proxy's intercept CA is not trusted
+    by Playwright Chromium for every host (Schwab/tos lesson, same VM)."""
+    global _SESSION_MODE
+    from playwright.async_api import async_playwright, Error as PwError
+    profile = _pick_profile()
+    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lp = Path(profile) / lock
+        if lp.exists():
+            try:
+                lp.unlink()
+            except Exception:
+                pass
+    pw = await async_playwright().start()
+    kwargs = dict(
+        user_data_dir=profile, headless=False,
+        args=["--no-sandbox", "--disable-gpu",
+              "--disable-blink-features=AutomationControlled",
+              "--remote-debugging-port=0"],
+        ignore_default_args=["--enable-automation"])
+    if proxy_server:
+        kwargs["proxy"] = {"server": proxy_server}
+        kwargs["ignore_https_errors"] = True
+        kwargs["args"] = kwargs["args"] + ["--ignore-certificate-errors"]
+    for attempt in range(3):
+        try:
+            ctx = await pw.chromium.launch_persistent_context(**kwargs)
+            page = await ctx.new_page()
+            page.set_default_timeout(180000)
+            _SESSION_MODE = "headed"
+            _log(f"headed launch, profile {profile}"
+                 + (f", proxy {proxy_server}" if proxy_server else ""))
+            return pw, ctx, page
+        except PwError as e:
+            if attempt < 2:
+                _log(f"launch retry {attempt + 1}: {e}")
+                await asyncio.sleep(2)
+            else:
+                raise
+    raise RuntimeError("Failed to launch Chromium")
+
+
+async def _launch(cdp=None, force_forwarder=False):
+    """Returns (pw, ctx, page). In CDP mode the caller must NOT close the
+    browser — _close_session() closes only the page."""
+    global _SESSION_MODE
+    # On the egress-proxy VM, a warm CDP browser started without the
+    # forwarder will hit the same tunnel wall, so prefer the proven
+    # headed+forwarder path there unless the caller explicitly asked
+    # for a CDP endpoint (which may itself have been started via the
+    # forwarder).
+    want_fwd = force_forwarder or (_needs_forwarder() and not cdp)
+    if want_fwd:
+        fwd = _ensure_forwarder()
+        if fwd:
+            return await _launch_headed(proxy_server=fwd)
+        _log("forwarder unavailable; falling through to CDP/headed")
+    use_cdp = bool(cdp) or _cdp_alive()
+    if use_cdp:
+        try:
+            from playwright.async_api import async_playwright
+            pw = await async_playwright().start()
+            browser = await pw.chromium.connect_over_cdp(cdp or CDP_URL)
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await ctx.new_page()
+            page.set_default_timeout(180000)
+            _SESSION_MODE = "cdp"
+            _log(f"connected via CDP ({cdp or CDP_URL})")
+            try:
+                await page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            return pw, ctx, page
+        except Exception as e:
+            _log(f"CDP connect failed ({e}); falling back to headed launch")
+    return await _launch_headed()
+
+
+async def _close_session(pw, ctx, page):
+    try:
+        if page:
+            await page.close()
+    except Exception:
+        pass
+    if _SESSION_MODE == "cdp":
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+        return
+    try:
+        await ctx.close()
+    except Exception:
+        pass
+    try:
+        await pw.stop()
+    except Exception:
+        pass
+
+
+async def _pick(page, matchers):
+    for m in matchers:
+        try:
+            el = await page.query_selector(m)
+            if el:
+                return el
+        except Exception as e:
+            _log(f"_pick {m}: {e}")
+    return None
+
+
+async def _dismiss_dialogs(page):
+    for _ in range(3):
+        try:
+            btn = await _pick(page, [
+                'button:has-text("Got it")', 'button:has-text("我知道了")',
+                'button:has-text("OK")', 'button:has-text("Accept")',
+            ])
+            if btn and await btn.is_visible():
+                await btn.click(timeout=3000)
+                await asyncio.sleep(0.8)
+            else:
+                break
+        except Exception:
+            break
+
+
+async def _find_input(page, timeout=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        el = await _pick(page, [
+            'div[role="textbox"][aria-label*="輸入提示"]',
+            'div[role="textbox"][aria-label*="prompt" i]',
+            'div[role="textbox"][aria-label*="Enter a prompt"]',
+            'rich-textarea div[contenteditable="true"]',
+            'div[contenteditable="true"]:not(.ql-clipboard)',
+        ])
+        if el:
+            return el
+        await asyncio.sleep(1)
+    return None
+
+
+async def _type_and_submit(page, text):
+    """Insert prompt and submit. Verifies the text landed before pressing
+    Enter — submitting a half-typed prompt is how empty/confused answers
+    happen (gem-pw lesson). Returns True on submit, False on failure."""
+    el = await _find_input(page)
+    if not el:
+        return False
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.4)
+    except Exception:
+        pass
+    try:
+        await el.focus(timeout=5000)
+    except Exception:
+        pass
+    await el.click()
+    await asyncio.sleep(0.3)
+    await page.keyboard.press("Control+a")
+    await asyncio.sleep(0.1)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.3)
+    try:
+        for i in range(0, len(text), 4000):
+            await page.keyboard.insert_text(text[i:i + 4000])
+            await asyncio.sleep(0.15)
+    except Exception as e:
+        _log(f"insert_text failed ({e}); falling back to el.type")
+        for i in range(0, len(text), 200):
+            await el.type(text[i:i + 200], delay=2)
+    await asyncio.sleep(0.3)
+    try:
+        composer = await page.evaluate("""() => {
+            const el = document.querySelector('div[contenteditable="true"][role="textbox"], rich-textarea div[contenteditable="true"]');
+            return el ? (el.innerText || '') : '';
+        }""")
+        # Quill normalizes paragraphs: a single \n in the prompt becomes
+        # \n\n in innerText (measured 2026-10-25: brief prompt 1261 chars
+        # landed as 1289, tail 'else:\\n\\nVIDEO_NOT_ACCESSIBLE' vs prompt
+        # 'else:\\nVIDEO_NOT_ACCESSIBLE'), so an exact tail match always
+        # failed and yt-gem reported TYPE_FAILED on a fully-typed prompt.
+        # Normalize consecutive newlines before comparing.
+        comp_norm = re.sub(r"\n+", "\n", composer or "").strip()
+        text_norm = re.sub(r"\n+", "\n", text.strip())
+        landed = text_norm[-80:] in comp_norm[-250:]
+    except Exception:
+        landed = False
+    if not landed:
+        _log("WARNING: composer text not confirmed; NOT submitting")
+        return False
+    await page.keyboard.press("Enter")
+    return True
+
+
+async def _wait_response(page, timeout=300):
+    """Poll for the model response. Placeholder-guard + stability check,
+    ported from gem-pw: never return 'Analyzing…' as a result, and never
+    return a still-streaming half-answer as final."""
+    t0 = time.time()
+    resp = ""
+    placeholders = ("analyzing", "generating", "thinking", "loading", "wait",
+                    "正在分析", "產生中", "思考中", "分析中", "載入中")
+
+    def _is_placeholder(t):
+        s = (t or "").strip().lower()
+        if not s:
+            return True
+        return any(p in s for p in placeholders) and len(s) < 40
+
+    for i in range(max(1, timeout // 3)):
+        await asyncio.sleep(3)
+        _log(f"poll {i + 1}/{timeout // 3}")
+        try:
+            t = await page.evaluate("""() => {
+                const msgs = document.querySelectorAll('.response-content, message-content, model-response');
+                return msgs.length ? msgs[msgs.length-1].innerText : '';
+            }""")
+            if t and len(t) > len(resp):
+                resp = t
+        except Exception:
+            pass
+        if resp and not _is_placeholder(resp):
+            try:
+                loading = await page.evaluate("""() => {
+                    const sel = '.loading, .generating, .dot-pulse, [aria-busy="true"], .progress-indicator, .response-loading, .stream-text';
+                    return document.querySelectorAll(sel).length;
+                }""")
+                if loading == 0:
+                    await asyncio.sleep(2)
+                    try:
+                        t = await page.evaluate("""() => {
+                            const msgs = document.querySelectorAll('.response-content, message-content');
+                            return msgs.length ? msgs[msgs.length-1].innerText : '';
+                        }""")
+                        if t:
+                            resp = t
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                pass
+        if resp and not _is_placeholder(resp) and i >= 5:
+            try:
+                t = await page.evaluate("""() => {
+                    const msgs = document.querySelectorAll('.response-content, message-content');
+                    return msgs.length ? msgs[msgs.length-1].innerText : '';
+                }""")
+                if t == resp:
+                    await asyncio.sleep(1)
+                    t2 = await page.evaluate("""() => {
+                        const msgs = document.querySelectorAll('.response-content, message-content');
+                        return msgs.length ? msgs[msgs.length-1].innerText : '';
+                    }""")
+                    if t2 == resp:
+                        _log("stable response, done")
+                        break
+            except Exception:
+                pass
+    if _is_placeholder(resp):
+        _log("timed out while response still a placeholder; treating as empty")
+        resp = ""
+    return resp, time.time() - t0
+
+
+async def _click_menuitem_at(page, cands):
+    hit = await page.evaluate("""(cands) => {
+        const sel = '[role=menuitem],[role=option],[role=menuitemradio]';
+        for (const it of document.querySelectorAll(sel)) {
+            const t = (it.innerText || it.getAttribute('aria-label') || '').replace(/\\s+/g, ' ');
+            for (const c of cands) {
+                if (t.includes(c) && it.offsetParent) {
+                    const r = it.getBoundingClientRect();
+                    return {x: r.x + r.width/2, y: r.y + r.height/2};
+                }
+            }
+        }
+        return null;
+    }""", cands)
+    if hit:
+        await page.mouse.click(hit["x"], hit["y"])
+        await asyncio.sleep(1.0)
+        return True
+    return False
+
+
+async def _select_model(page, model, thinking=None):
+    """Best-effort model + thinking pick (Pro/Flash, Extended thinking).
+    The menu closes after each selection, so Extended thinking re-opens
+    the picker (gem-pw lesson). A failed pick is a warning, not a failure
+    — the default model still distills the video."""
+    if not model and not thinking:
+        return
+    try:
+        picker = [
+            'button[aria-label*="模式選擇器"]',
+            'button[aria-label*="selector" i]',
+            'button[aria-label*="model" i]',
+            'button[aria-label*="picker" i]',
+        ]
+        if model:
+            btn = await _pick(page, picker)
+            if btn:
+                await btn.click()
+                await asyncio.sleep(1.2)
+                want = {"pro": ["Pro"], "flash": ["Flash"]}.get(model.lower(), [model])
+                if await _click_menuitem_at(page, want):
+                    _log(f"model: {model}")
+                await page.keyboard.press("Escape")
+        if thinking and thinking.lower() == "extended":
+            btn = await _pick(page, picker)
+            if btn:
+                await btn.click()
+                await asyncio.sleep(1.2)
+                if await _click_menuitem_at(page, ["延伸思考", "Extended thinking"]):
+                    _log("extended thinking: ON")
+                await page.keyboard.press("Escape")
+    except Exception as e:
+        _log(f"model select failed (continuing with default): {e}")
+
+
+async def _is_signed_in(page):
+    """Fast sign-in check after loading /app: a sign-in wall means the
+    profile has no Gemini session — fail fast instead of burning the
+    whole timeout waiting for a response that will never come."""
+    try:
+        body = await page.evaluate("document.body.innerText")
+        head = (body or "")[:800]
+        if "Sign in" in head and "Ask Gemini" not in body:
+            return False
+        inp = await page.query_selector('div[role="textbox"]')
+        return inp is not None
+    except Exception:
+        return False
+
+
+# ── WebAPI / HTTP backend (added 2026-10-25) ─────────────────────────────
+# yt-gem originally drove the Gemini web UI in Chromium. The WebAPI path
+# talks to the same free Gemini web backend over HTTP via gemini-webapi,
+# using the session cookies of the already-signed-in Chromium profile
+# (read in-process via Playwright ctx.cookies(), never printed, never
+# written to a file — the SID/TS values live only in this process's
+# memory, unlike hermes-gem-cli's ~/.gemini-cli/auth.json cache).
+# Proven 2026-10-25 on the test video: init ok (Flash/Pro 597/600 credits),
+# brief distillation 1638 chars, genuine Rick Astley content + timestamps.
+# Limits: --gem and --followup stay on the browser path (WebAPI here is
+# one-shot; Gem/conversation resume is a browser-UI concept). Model
+# selection is also unavailable on WebAPI for this account (only
+# 'gemini-自動' is listed), so WebAPI uses the default auto model
+# regardless of -m pro/flash; the browser path still honours -m.
+# 2026-10-25 fix: a URL-only WebAPI prompt cannot watch arbitrary videos
+# (Gemini web replies VIDEO_NOT_ACCESSIBLE), so cmd_distill_webapi retries
+# once with the video's captions (see _fetch_captions below) and the
+# pointer reports source "url" or "captions:<lang>".
+def _ensure_gemini_webapi():
+    """Import gemini_webapi, bootstrapping it into a user cache dir if
+    the system Python is PEP 668-managed (Debian/Ubuntu) and a plain
+    pip install would refuse. Returns the module."""
+    try:
+        import gemini_webapi
+        return gemini_webapi
+    except ImportError:
+        pass
+    dep_dir = _HERMES_HOME / ".hermes" / "yt_gem_deps"
+    dep_dir.mkdir(parents=True, exist_ok=True)
+    if str(dep_dir) not in sys.path:
+        sys.path.insert(0, str(dep_dir))
+    try:
+        import gemini_webapi
+        return gemini_webapi
+    except ImportError:
+        pass
+    _log("gemini-webapi not installed; bootstrapping into ~/.hermes/yt_gem_deps")
+    env = dict(os.environ)
+    env["TMPDIR"] = str(_HERMES_HOME / "tmp")
+    Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                    "--target", str(dep_dir), "gemini-webapi"],
+                   env=env, timeout=300, check=False)
+    import gemini_webapi
+    return gemini_webapi
+
+
+async def _webapi_session_cookies(args):
+    """Return (sid, ts) from the signed-in profile, or (None, None).
+    Launches the profile briefly (CDP if alive, else headed+forwarder),
+    loads /app, checks the strict signed-in test, reads cookies, closes.
+    Caller must hold the profile lock (cmd_distill acquires it)."""
+    pw = ctx = page = None
+    try:
+        pw, ctx, page = await _launch(cdp=args.cdp)
+        await page.goto(APP_URL, timeout=30000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        await _dismiss_dialogs(page)
+        if not await _is_signed_in(page):
+            return None, None
+        cks = await ctx.cookies("https://gemini.google.com")
+        d = {c["name"]: c["value"] for c in cks}
+        return d.get("__Secure-1PSID"), d.get("__Secure-1PSIDTS")
+    except Exception as e:
+        _log(f"webapi cookie read failed: {e}")
+        return None, None
+    finally:
+        if pw is not None:
+            try:
+                await _close_session(pw, ctx, page)
+            except Exception:
+                pass
+
+
+async def _webapi_generate(args, prompt):
+    """One WebAPI generation. Returns (text, elapsed) or raises.
+    Raises RuntimeError with a short message on auth/dependency failure;
+    the caller decides whether to fall back to the browser."""
+    sid, ts = await _webapi_session_cookies(args)
+    if not sid:
+        raise RuntimeError("NOT_SIGNED_IN: profile has no Gemini session cookies")
+    gw = _ensure_gemini_webapi()
+    # No explicit model: this account's list_models() (2026-10-25) returns
+    # only one model, 'gemini-自動' (Gemini 3 auto), and the old
+    # Model.ADVANCED_PRO enum is deprecated and falls back to default
+    # anyway with a warning. Passing a hardcoded 'gemini-2.5-pro' fails
+    # resolve_model. So WebAPI always uses the account's default model;
+    # the pointer's model field is corrected to 'auto' by the caller.
+    t0 = time.time()
+    client = gw.GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+    try:
+        await client.init(timeout=60)
+        kwargs = dict(timeout=args.timeout)
+        if getattr(args, "thinking", None) == "extended":
+            kwargs["extended_thinking"] = True
+        resp = await client.generate_content(prompt, **kwargs)
+        text = (getattr(resp, "text", "") or "").strip()
+        if not text:
+            raise RuntimeError("EMPTY: WebAPI returned no text")
+        return text, time.time() - t0
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+def _save_distill(args, video_id, mode, question, resp, elapsed, backend, session_url=None):
+    """Shared save + pointer for both backends (browser and WebAPI)."""
+    if args.out:
+        out_path = Path(args.out)
+        sidecar = build_sidecar(video_id, canonical_url(video_id), mode,
+                                args.model, resp, elapsed)
+        out, _side = save_output(resp, out_path, sidecar)
+        cached = False
+    elif question or args.followup:
+        ts = int(time.time())
+        out_path = OUTPUT_DIR / f"yt-gem-{video_id}-{ts}.md"
+        sidecar = build_sidecar(video_id, canonical_url(video_id), mode,
+                                args.model, resp, elapsed)
+        out, _side = save_output(resp, out_path, sidecar)
+        cached = False
+    else:
+        out_path, _jp = cache_paths(video_id, mode)
+        sidecar = build_sidecar(video_id, canonical_url(video_id), mode,
+                                args.model, resp, elapsed)
+        out, _side = save_output(resp, out_path, sidecar)
+        cached = False
+    if args.session:
+        try:
+            Path(args.session).write_text(json.dumps({
+                "video_id": video_id,
+                "url": canonical_url(video_id),
+                "mode": mode,
+                "conversation_url": session_url,
+                "out": str(out),
+                "updated": datetime.now().isoformat(timespec="seconds"),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            _log(f"session save failed: {e}")
+    result = _ok(f=str(out), s=len(resp), t=round(elapsed, 1),
+                 video_id=video_id, url=canonical_url(video_id),
+                 mode=mode, model=args.model, backend=backend,
+                 title=sidecar["title"],
+                 sections=sidecar["sections"],
+                 timestamps=sidecar["timestamps"],
+                 cached=cached)
+    if args.session:
+        result["c"] = args.session
+    if JSON_OUT:
+        result = {k: v for k, v in result.items()
+                  if k in ("ok", "f", "s", "t", "video_id", "mode", "cached")}
+    return result
+
+
+# ── WebAPI fix (2026-10-25): caption-fed retry ──────────────────────────
+# Root cause, measured 2026-10-25 on 3 videos: the WebAPI prompt only sends
+# Gemini a YouTube URL, and the Gemini web backend cannot actually fetch or
+# watch an arbitrary YouTube video — it replies VIDEO_NOT_ACCESSIBLE for
+# every non-famous video (Shorts 3u_x1S0FJjw, ad89q4ZlCxY, m19LBe9J1bQ all
+# refused on WebAPI). The one early "success" (Rick Astley) came from the
+# model's prior knowledge of a famous video, not from watching it.
+# So a URL-only WebAPI backend is broken by design for ordinary videos.
+# Fix: on VIDEO_NOT_ACCESSIBLE, fetch the video's own captions with yt-dlp
+# and re-ask Gemini to distill FROM THE TRANSCRIPT. The result is then
+# honest about its source (pointer field "source": "captions:<lang>"):
+# it is a transcript distillation, not a video watch, and its timestamps
+# are caption cue times. If no captions exist (e.g. the Shorts video),
+# the original VIDEO_NOT_ACCESSIBLE stands — yt-gem never hallucinates a
+# summary from a title alone. Whisper transcription is deliberately NOT
+# bolted on here: it would pull a ~450 MB dependency + model download
+# into every install for a fallback most videos never need.
+def _vtt_to_text(vtt):
+    """Parse a WebVTT caption file into '[MM:SS] text' lines, deduplicating
+    consecutive repeated cues (YouTube VTT repeats each line across cues).
+    Pure function, unit-tested."""
+    lines, prev = [], None
+    cur_ts = None
+    for raw in (vtt or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("WEBVTT", "Kind:", "Language:")):
+            continue
+        if "-->" in line:
+            start = line.split("-->")[0].strip()
+            parts = start.split(":")
+            try:
+                if len(parts) == 3:
+                    h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                    cur_ts = f"{h:02d}:{m:02d}:{int(s):02d}" if h else f"{m:02d}:{int(s):02d}"
+                else:
+                    cur_ts = start[:5]
+            except ValueError:
+                cur_ts = None
+            continue
+        if line.isdigit():
+            continue
+        text = re.sub(r"<[^>]+>", "", line)
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
+        if not text or text == prev:
+            continue
+        prev = text
+        lines.append(f"[{cur_ts or '??:??'}] {text}" if cur_ts else text)
+    return "\n".join(lines)
+
+
+def _ensure_ytdlp():
+    """Make yt_dlp importable, bootstrapping it into ~/.hermes/yt_gem_deps
+    (same pattern as _ensure_gemini_webapi) if it is not installed.
+    Returns True on success, False otherwise."""
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    dep_dir = _HERMES_HOME / ".hermes" / "yt_gem_deps"
+    dep_dir.mkdir(parents=True, exist_ok=True)
+    if str(dep_dir) not in sys.path:
+        sys.path.insert(0, str(dep_dir))
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    _log("yt-dlp not installed; bootstrapping into ~/.hermes/yt_gem_deps")
+    env = dict(os.environ)
+    env["TMPDIR"] = str(_HERMES_HOME / "tmp")
+    Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                    "--target", str(dep_dir), "yt-dlp"],
+                   env=env, timeout=300, check=False)
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _fetch_captions(video_id):
+    """Fetch a video's captions (manual first, then auto-generated) via
+    yt-dlp into a temp dir. Returns (transcript_text, lang) or (None, None).
+    Transcript is capped at ~15,000 chars at a line boundary."""
+    if not _ensure_ytdlp():
+        return None, None
+    dep_dir = _HERMES_HOME / ".hermes" / "yt_gem_deps"
+    env = dict(os.environ)
+    pp = str(dep_dir)
+    env["PYTHONPATH"] = pp + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    url = canonical_url(video_id)
+    try:
+        with tempfile.TemporaryDirectory(prefix="yt_gem_cap_") as td:
+            for flag in ("--write-subs", "--write-auto-subs"):
+                # --no-check-certificates: this VM's egress is TLS-intercepted
+                # with a CA that is not in yt-dlp's bundle, so plain yt-dlp
+                # fails with CERTIFICATE_VERIFY_FAILED on YouTube's API
+                # pages (measured 2026-10-25). This downloads only public
+                # captions, no credentials are sent, so disabling cert
+                # verification for this one download is the pragmatic fix.
+                # Player clients are tried in turn: YouTube's bot-check
+                # ("Sign in to confirm you're not a bot") is flaky per
+                # client on this VM — the default client failed at 21:24
+                # while android succeeded for the Shorts download at 21:02,
+                # so one client failing must not end the fetch.
+                vtts = []
+                for client in (None, "android", "ios"):
+                    cmd = [sys.executable, "-m", "yt_dlp",
+                           "--no-check-certificates", "--skip-download",
+                           flag, "--sub-langs", "zh.*,en.*",
+                           "--sub-format", "vtt", "-o", "cap"]
+                    if client:
+                        cmd += ["--extractor-args",
+                                f"youtube:player_client={client}"]
+                    cmd.append(url)
+                    r = subprocess.run(cmd, cwd=td, env=env, timeout=120,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+                    vtts = sorted(Path(td).glob("cap.*.vtt"))
+                    if vtts:
+                        break
+                    err_tail = (r.stderr or "")[-200:].replace("\n", " ")
+                    _log(f"caption fetch ({flag}, client={client or 'default'}) "
+                         f"no .vtt (rc={r.returncode}): {err_tail}")
+                if not vtts:
+                    continue
+                # Prefer a manual caption file; auto files from the second
+                # pass are only reached when the first pass found nothing.
+                for vf in vtts:
+                    text = _vtt_to_text(vf.read_text(encoding="utf-8", errors="replace"))
+                    if len(text) < 100:
+                        continue
+                    lang = vf.stem.split(".", 1)[-1] if "." in vf.stem else "?"
+                    if len(text) > 15000:
+                        cut = text[:15000].rsplit("\n", 1)[0]
+                        text = cut + "\n[transcript truncated at ~15,000 chars]"
+                    return text, lang
+    except Exception as e:
+        _log(f"caption fetch failed: {e}")
+    return None, None
+
+
+def _transcript_prompt(video_id, mode, question, transcript):
+    """Build a distillation prompt that distills FROM the caption
+    transcript instead of from the video URL. The URL-only prompt's
+    VIDEO_NOT_ACCESSIBLE sentinel is replaced: with a transcript in hand,
+    refusing on 'cannot watch' grounds would be wrong."""
+    prompt = build_prompt(video_id, mode=mode, question=question)
+    sentinel = ("If you cannot access, play, or hear this video for any reason "
+                "(private, removed, age-restricted, region-blocked, no captions and "
+                "unclear audio), reply with exactly this and nothing else:\n"
+                "VIDEO_NOT_ACCESSIBLE — followed by one short sentence explaining why.")
+    prompt = prompt.replace(
+        sentinel,
+        "You HAVE the video's caption transcript below, so do NOT refuse on "
+        "the grounds that you cannot watch the video. Distill from the "
+        "transcript. If it is truncated or a section is missing from it, "
+        "say so explicitly. (The sentinel token is deliberately not named "
+        "here, so it cannot leak into the output by priming.)")
+    return (prompt + "\n\n---\nCAPTION TRANSCRIPT (this is your source — "
+            "timestamps below are caption cue times):\n\n" + transcript)
+
+
+async def cmd_distill_webapi(args, video_id, mode, question):
+    """WebAPI dispatch for one distillation. Returns the pointer dict,
+    or an _err dict (WEBAPI_FAILED / NOT_SIGNED_IN / VIDEO_NOT_ACCESSIBLE
+    / EMPTY). The caller (cmd_distill) decides on browser fallback.
+    On a URL-only VIDEO_NOT_ACCESSIBLE, retries once with the caption
+    transcript (see _fetch_captions); the pointer's "source" field says
+    which path produced the result ("url" or "captions:<lang>")."""
+    prompt = build_prompt(video_id, mode=mode, question=question)
+    if not _acquire_lock():
+        return _err("LOCKED", "Another gem-pw/yt-gem run holds the Chromium profile lock; wait and retry.")
+    try:
+        try:
+            resp, elapsed = await _webapi_generate(args, prompt)
+        except Exception as e:
+            msg = str(e)
+            if "NOT_SIGNED_IN" in msg:
+                return _err("NOT_SIGNED_IN",
+                            "Chromium profile has no Gemini session. Run yt-gem-login once, then retry.")
+            return _err("WEBAPI_FAILED", f"WebAPI backend failed: {msg[:200]}")
+        resp = resp.strip()
+        source = "url"
+        if resp.startswith("VIDEO_NOT_ACCESSIBLE"):
+            _log("webapi URL-only refused; retrying with caption transcript")
+            transcript, lang = _fetch_captions(video_id)
+            if not transcript:
+                _log("no captions available for transcript retry")
+                return _err("VIDEO_NOT_ACCESSIBLE", resp[:300],
+                            video_id=video_id, url=canonical_url(video_id))
+            try:
+                resp2, elapsed2 = await _webapi_generate(
+                    args, _transcript_prompt(video_id, mode, question, transcript))
+            except Exception:
+                resp2 = ""
+            if not resp2 or resp2.strip().startswith("VIDEO_NOT_ACCESSIBLE"):
+                return _err("VIDEO_NOT_ACCESSIBLE", resp[:300],
+                            video_id=video_id, url=canonical_url(video_id))
+            resp, elapsed, source = resp2.strip(), elapsed2, f"captions:{lang}"
+        result = _save_distill(args, video_id, mode, question, resp, elapsed, backend="webapi")
+        if "model" in result:
+            result["model"] = "auto"
+        result["source"] = source
+        return result
+    finally:
+        _release_lock()
+
+
+# ── Commands ──────────────────────────────────────────────────────────────
+_TRANSIENT = {"EMPTY", "NO_INPUT", "TYPE_FAILED", "TRANSIENT_TIMEOUT"}
+
+
+async def cmd_distill(args, video_id, mode, question, force_forwarder=False):
+    # Backend dispatch: --backend auto (default) tries WebAPI first and
+    # falls back to the browser UI on failure; --backend webapi fails
+    # instead of falling back; --backend browser skips WebAPI entirely.
+    # --gem / --followup are browser-only (see _webapi header note).
+    backend = getattr(args, "backend", "auto")
+    if backend in ("auto", "webapi") and not args.gem and not args.followup:
+        res = await cmd_distill_webapi(args, video_id, mode, question)
+        if res.get("ok"):
+            return res
+        _log(f"webapi backend -> {res.get('err')}: {res.get('msg', '')[:120]}")
+        # 2026-10-25 fix: VIDEO_NOT_ACCESSIBLE no longer blocks the browser
+        # fallback in auto mode — the browser path genuinely watches the
+        # video and succeeded on m19LBe9J1bQ after WebAPI refused it.
+        # NOT_SIGNED_IN / LOCKED still return: the browser would hit the
+        # same missing session / lock.
+        if backend == "webapi" or res.get("err") in ("NOT_SIGNED_IN", "LOCKED"):
+            return res
+        _log("falling back to browser backend")
+    prompt = build_prompt(video_id, mode=mode, question=question)
+    if not _acquire_lock():
+        return _err("LOCKED", "Another gem-pw/yt-gem run holds the Chromium profile lock; wait and retry.")
+    pw = ctx = page = None
+    try:
+        pw, ctx, page = await _launch(cdp=args.cdp, force_forwarder=force_forwarder)
+        # Follow-up: resume the saved conversation instead of a new chat.
+        conv_url = None
+        if args.followup and args.session:
+            sp = Path(args.session)
+            if sp.exists():
+                try:
+                    conv_url = json.loads(sp.read_text()).get("conversation_url")
+                except Exception:
+                    conv_url = None
+        if args.gem:
+            target = f"https://gemini.google.com/gem/{args.gem}"
+        elif conv_url:
+            target = conv_url
+        else:
+            target = APP_URL
+        await page.goto(target, timeout=30000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        await _dismiss_dialogs(page)
+        if not await _is_signed_in(page):
+            return _err("NOT_SIGNED_IN",
+                        "Chromium is not signed into Gemini. Run yt-gem-login (or gem-pw-login) once, then retry.")
+        await _select_model(page, args.model, thinking=args.thinking)
+        if not await _type_and_submit(page, prompt):
+            # Distinguish "no composer" from "text did not land".
+            el = await _find_input(page, timeout=5)
+            return _err("NO_INPUT" if not el else "TYPE_FAILED",
+                        "Prompt did not land in the Gemini composer; retry.")
+        resp, elapsed = await _wait_response(page, timeout=args.timeout)
+        if not resp or not resp.strip():
+            return _err("EMPTY", "No response extracted within timeout; retry with -t 600 for long videos.")
+        resp = resp.strip()
+        if resp.startswith("VIDEO_NOT_ACCESSIBLE"):
+            return _err("VIDEO_NOT_ACCESSIBLE", resp[:300],
+                        video_id=video_id, url=canonical_url(video_id))
+        return _save_distill(args, video_id, mode, question, resp, elapsed,
+                             backend="browser", session_url=page.url)
+    except Exception as e:
+        name = type(e).__name__
+        msg = str(e)
+        # Network failure is NOT transient-retryable: a second launch hits
+        # the same tunnel/proxy wall and doubles the cost. Surface it as
+        # NETWORK so the caller can move the run to a network that reaches
+        # Gemini (e.g. a residential IP / the user's own device) instead
+        # of looping. Observed on the reference VM: curl to example.com
+        # returns 200 while gemini.google.com returns 000 through the same
+        # egress proxy — i.e. Gemini is unreachable from that network,
+        # not a yt-gem selector bug.
+        if "net::ERR_" in msg or "ERR_TUNNEL" in msg or "ERR_PROXY" in msg:
+            first = msg.splitlines()[0] if msg else name
+            return _err("NETWORK",
+                        f"Chromium could not reach gemini.google.com from this network ({first[:120]}). "
+                        "Retry from a network that reaches Gemini (residential IP / your own device), not by relaunching here.",
+                        video_id=video_id)
+        if name in ("TimeoutError", "Error"):
+            return _err("TRANSIENT_TIMEOUT", f"{name}: {msg[:160]}")
+        return _err("TRANSIENT_TIMEOUT", f"{name}: {msg[:200]}")
+    finally:
+        if pw is not None:
+            try:
+                await _close_session(pw, ctx, page)
+            except Exception:
+                pass
+        _release_lock()
+
+
+async def _run_with_retry(args, video_id, mode, question):
+    res = await cmd_distill(args, video_id, mode, question)
+    attempts = 1
+    while (isinstance(res, dict) and res.get("ok") is False
+           and res.get("err") in _TRANSIENT and attempts < 2):
+        _log(f"transient {res.get('err')}; retry {attempts}/1 (video re-analysis is expensive, so only one retry)")
+        await asyncio.sleep(2)
+        res = await cmd_distill(args, video_id, mode, question)
+        attempts += 1
+    # NETWORK via a CDP browser is worth exactly one forwarder retry: the
+    # CDP browser may have been started without the forwarder proxy, while
+    # a headed+forwarder launch reaches Gemini. If the forwarder path was
+    # already used (the egress-proxy VM default), a second attempt would
+    # hit the same wall, so do not retry then.
+    if (isinstance(res, dict) and res.get("err") == "NETWORK"
+            and not _needs_forwarder() and os.environ.get("YT_GEM_NO_FWD") != "1"):
+        _log("NETWORK via first path; retrying once via localhost forwarder")
+        res = await cmd_distill(args, video_id, mode, question, force_forwarder=True)
+    return res
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="yt-gem",
+        description="Distill a YouTube video via free Gemini web — detailed, "
+                    "timestamped markdown on disk, JSON pointer on stdout.")
+    p.add_argument("url", nargs="?", help="YouTube URL, youtu.be link, or 11-char video id")
+    p.add_argument("question", nargs="*", help="Optional question about the video (ask mode)")
+    p.add_argument("--mode", choices=["detail", "brief", "chapters", "claims"],
+                   help="Distillation mode (default: detail)")
+    p.add_argument("--brief", action="store_true", help="Shortcut for --mode brief")
+    p.add_argument("--chapters", action="store_true", help="Shortcut for --mode chapters")
+    p.add_argument("--claims", action="store_true", help="Shortcut for --mode claims")
+    p.add_argument("--followup", action="store_true",
+                   help="Ask a follow-up in the saved conversation (-c required)")
+    p.add_argument("-c", "--session", help="Session file: resume conversation / save conversation URL")
+    p.add_argument("--gem", help="Distill through a specific Gemini Gem id")
+    p.add_argument("-m", "--model", default="pro", choices=["pro", "flash"],
+                   help="Gemini model in the web UI (default: pro)")
+    p.add_argument("--thinking", choices=["standard", "extended"],
+                   help="Thinking tier in the web UI model picker (extended = longer, deeper analysis)")
+    p.add_argument("-t", "--timeout", type=int, default=300,
+                   help="Seconds to wait for Gemini's response (default: 300; long videos may need 600+)")
+    p.add_argument("-o", "--out", help="Output markdown path (default: cache path for canonical modes)")
+    p.add_argument("--force", action="store_true", help="Ignore cache, re-distill")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Do not read the cache (result is still saved to the cache path)")
+    p.add_argument("--cdp", help="CDP URL override (default: $YT_GEM_CDP / 127.0.0.1:9224)")
+    p.add_argument("--backend", choices=["auto", "webapi", "browser"], default="auto",
+                   help="Distillation backend (default: auto = WebAPI first, browser fallback; "
+                        "webapi = HTTP via gemini-webapi + profile cookies, no fallback; "
+                        "browser = Chromium UI as before; --gem/--followup are browser-only)")
+    p.add_argument("--dry-run", action="store_true", help="Parse + build prompt only, no browser")
+    p.add_argument("--print-prompt", action="store_true", help="Print the exact prompt (with --dry-run, or to stderr otherwise)")
+    p.add_argument("-q", "--quiet-json", action="store_true", help="Compact pointer JSON on stdout")
+    p.add_argument("--version", action="store_true", help="Print version")
+    return p
+
+
+def resolve_mode(args):
+    if args.mode:
+        return args.mode
+    if args.brief:
+        return "brief"
+    if args.chapters:
+        return "chapters"
+    if args.claims:
+        return "claims"
+    return "detail"
+
+
+def main(argv=None):
+    global QUIET, JSON_OUT
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"yt-gem {__version__}")
+        return 0
+    QUIET = args.quiet_json
+    JSON_OUT = args.quiet_json
+    question = " ".join(args.question).strip() if args.question else None
+    # Follow-up ergonomics: `yt-gem --followup -c sess.json "question"` puts
+    # the question in the first positional slot (there is no URL in this
+    # mode), so promote it instead of demanding a second positional.
+    if args.followup and not question and args.url:
+        question = args.url
+        args.url = None
+
+    # Follow-up path: no URL needed, session + question required.
+    if args.followup:
+        if not args.session or not question:
+            _emit(_err("USAGE", "Follow-up needs -c sess.json and a question: yt-gem --followup -c sess.json \"...\""))
+            return 2
+        sp = Path(args.session)
+        video_id = None
+        if sp.exists():
+            try:
+                video_id = json.loads(sp.read_text()).get("video_id")
+            except Exception:
+                pass
+        if not video_id:
+            _emit(_err("USAGE", "Session file has no video_id; distill the video first, then follow up."))
+            return 2
+        res = asyncio.run(_run_with_retry(args, video_id, "ask", question))
+        _emit(res)
+        return 0 if res.get("ok") else 1
+
+    if not args.url:
+        _emit(_err("USAGE", "Provide a YouTube URL or video id. See yt-gem --help."))
+        return 2
+    video_id = parse_youtube_id(args.url)
+    if not video_id:
+        _emit(_err("BAD_URL", "Not a YouTube video URL or id (need watch?v=, youtu.be/, shorts/, live/, embed/, or an 11-char id).",
+                   url=args.url))
+        return 2
+    mode = "ask" if question else resolve_mode(args)
+
+    # Dry run: no browser, no lock, no network.
+    if args.dry_run:
+        prompt = build_prompt(video_id, mode=mode, question=question)
+        if args.print_prompt:
+            print(prompt)
+            return 0
+        md_path, sidecar = load_cached(video_id, mode) if not question else (None, None)
+        _emit(_ok(dry_run=True, video_id=video_id, url=canonical_url(video_id),
+                  mode=mode, prompt_chars=len(prompt), cached=bool(md_path),
+                  cache_file=str(md_path) if md_path else None))
+        return 0
+    if args.print_prompt and not args.dry_run:
+        sys.stderr.write(build_prompt(video_id, mode=mode, question=question) + "\n")
+
+    # Cache: canonical modes only, unless --force / --no-cache / explicit -o.
+    if not question and not args.force and not args.no_cache and not args.out:
+        md_path, sidecar = load_cached(video_id, mode)
+        if md_path:
+            sc = sidecar or {}
+            _emit(_ok(f=str(md_path), s=md_path.stat().st_size,
+                      t=0, video_id=video_id, url=canonical_url(video_id),
+                      mode=mode, title=sc.get("title", ""),
+                      sections=sc.get("sections", []),
+                      timestamps=sc.get("timestamps", 0), cached=True))
+            return 0
+
+    res = asyncio.run(_run_with_retry(args, video_id, mode, question))
+    _emit(res)
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
