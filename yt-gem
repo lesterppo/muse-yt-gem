@@ -517,6 +517,7 @@ def _fwd_script_path():
     for cand in [
         here / "proxy_fwd.py",
         argv_dir / "proxy_fwd.py" if argv_dir else None,
+        Path.home() / "workspace" / "muse-yt-gem" / "proxy_fwd.py",
         Path.home() / "workspace" / "hermes-yt-gem" / "proxy_fwd.py",
         Path.home() / "workspace" / "tos-cli" / "proxy_fwd.py",
     ]:
