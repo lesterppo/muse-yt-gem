@@ -64,8 +64,8 @@ Videos with no captions at all still fail cleanly with
 ## Install
 
 ```bash
-git clone https://github.com/lesterppo/hermes-yt-gem.git
-cd hermes-yt-gem
+git clone https://github.com/lesterppo/muse-yt-gem.git
+cd muse-yt-gem
 bash install.sh
 ```
 
